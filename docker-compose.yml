@@ -1,0 +1,49 @@
+services:
+  db:
+    image: postgres:15
+    container_name: ap2-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: 1234
+    ports: ["5436:5432"]
+    volumes:
+      - ./init-db:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+  payment-service:
+    build:
+      context: .
+      dockerfile: ./payment-service/Dockerfile
+    container_name: payment-service
+    environment:
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_USER=postgres
+      - DB_PASSWORD=1234
+      - DB_NAME=payment_db
+      - PAYMENT_GRPC_PORT=50051
+      - PAYMENT_REST_PORT=8082
+    ports: ["8082:8082", "50051:50051"]
+    depends_on:
+      db: { condition: service_healthy }
+  order-service:
+    build:
+      context: .
+      dockerfile: ./order-service/Dockerfile
+    container_name: order-service
+    environment:
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_USER=postgres
+      - DB_PASSWORD=1234
+      - DB_NAME=order_db
+      - PAYMENT_GRPC_ADDR=payment-service:50051
+      - ORDER_GRPC_PORT=50052
+      - ORDER_REST_PORT=8081
+    ports: ["8081:8081", "50052:50052"]
+    depends_on:
+      db: { condition: service_healthy }
+      payment-service: { condition: service_started }

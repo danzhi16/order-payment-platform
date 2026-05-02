@@ -1,0 +1,29 @@
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+
+# Claude Code local settings
+.claude/
+
+# Nested repositories (tracked separately on GitHub)
+contracts-repo/
+proto-repo/
+
+# Environment files (may contain secrets)
+.env
+**/.env
+!**/.env.example
+
+# Go build artifacts
+*.exe
+*.test
+*.out
+order-service/order-service
+payment-service/payment-service
+/bin/
+/dist/
+
+# Logs
+*.log
