@@ -266,3 +266,170 @@ grpcurl → gRPC Handler (GetPaymentStats)
 ```bash
 grpcurl -plaintext -d '{}' localhost:50051 payment.PaymentService/GetPaymentStats
 ```
+
+---
+
+# Assignment 3 — Event-Driven Architecture (RabbitMQ)
+
+Adds a `notification-service` consumer fed by `payment-service` over RabbitMQ.
+The synchronous gRPC link between Order and Payment is unchanged; the new flow
+is purely additive.
+
+## Architecture
+
+```
+   ┌──────────────┐  POST /orders   ┌────────────────┐   gRPC    ┌──────────────────┐
+   │  Client      │────────────────▶│ Order Service  │──────────▶│ Payment Service  │
+   └──────────────┘                 └────────────────┘           │ (Producer)       │
+                                                                 └────────┬─────────┘
+                                                                          │ publish (durable, persistent,
+                                                                          │ publisher-confirm, MessageId=uuid)
+                                                                          ▼
+                                                       ┌─────────────────────────────────┐
+                                                       │ RabbitMQ                        │
+                                                       │  exchange: payment.events       │  topic
+                                                       │  └─ rk: payment.completed       │
+                                                       │     └─ queue: notification.     │  durable
+                                                       │        payment.completed        │  prefetch=1
+                                                       │           │ x-dead-letter-exch  │
+                                                       │           ▼                     │
+                                                       │  exchange: payment.events.dlx   │
+                                                       │  └─ queue: notification.        │
+                                                       │     payment.completed.dlq       │
+                                                       └────────────────┬────────────────┘
+                                                                        │ consume (auto-ack=false)
+                                                                        ▼
+                                                              ┌────────────────────┐
+                                                              │ Notification       │
+                                                              │ Service (Consumer) │
+                                                              │  - idempotency map │
+                                                              │  - manual ack      │
+                                                              │  - bounded retries │
+                                                              └────────────────────┘
+```
+
+## Event flow
+
+1. Client → `POST /orders` → Order Service writes to `order_db`.
+2. Order Service → gRPC `ProcessPayment` → Payment Service.
+3. Payment Service writes the payment row, then calls `EventPublisher.Publish`
+   on the `payment.events` exchange with routing key `payment.completed`.
+4. RabbitMQ routes the message to the durable `notification.payment.completed`
+   queue.
+5. Notification Service consumes the message, dedupes by `MessageId`, prints
+   `[Notification] Sent email to … for Order #… Amount: $…`, and **then**
+   acknowledges.
+
+Event payload (JSON):
+
+```json
+{
+  "id":             "<uuid>",
+  "type":           "payment.completed",
+  "order_id":       42,
+  "amount":         5000,
+  "customer_email": "customer-42@example.com",
+  "status":         "Authorized",
+  "occurred_at":    "2026-05-02T18:00:00Z"
+}
+```
+
+> **Note on `customer_email`.** The existing gRPC contract carries only
+> `order_id` and `amount`. To avoid a cross-repo proto change for an academic
+> deliverable, the payment service synthesises `customer-{order_id}@example.com`.
+> Threading the real email end-to-end is straightforward (extend the proto +
+> regenerate) and not architecturally interesting for this assignment.
+
+## Idempotency strategy
+
+The producer stamps every published message with a unique `MessageId` (a 16-byte
+random hex string, generated *once* per business event). The consumer keeps a
+thread-safe FIFO-evicted in-memory set of processed ids
+([`notification-service/internal/messaging/idempotency.go`](notification-service/internal/messaging/idempotency.go)).
+
+Per-delivery flow:
+
+1. `MarkIfNew(MessageId)` → if **false**, the message has already been processed.
+   The consumer Acks it (so the broker stops redelivering) and skips the work.
+2. If **true**, the consumer runs the handler.
+3. If the handler **fails**, the id is `Forget`-ten so the retry actually
+   reprocesses (otherwise the dedup store would permanently swallow it).
+
+This is "at-least-once delivery + idempotent consumer" — the standard pattern
+when you can't get exactly-once from the broker. A production deployment would
+swap the in-memory set for Redis or a `processed_messages(message_id PK)` table.
+
+## ACK logic (manual, never auto-ack)
+
+The consumer is created with `auto-ack = false`
+([`notification-service/internal/messaging/consumer.go`](notification-service/internal/messaging/consumer.go)).
+Outcomes per delivery:
+
+| Outcome                            | Action                          | Result                              |
+|------------------------------------|---------------------------------|-------------------------------------|
+| Handler success                    | `d.Ack(false)`                  | Broker drops the message.           |
+| Duplicate (seen MessageId)         | `d.Ack(false)`                  | Broker drops; no duplicate work.    |
+| Malformed JSON                     | `d.Nack(false, false)`          | Permanent — straight to DLQ.        |
+| Permanent error (`ErrPermanent`)   | `d.Nack(false, false)`          | Straight to DLQ. (Demo: order_id 999.) |
+| Transient error, attempts < N      | `d.Nack(false, true)`           | Requeued for redelivery.            |
+| Transient error, attempts = N      | `d.Nack(false, false)`          | Goes to DLQ.                        |
+
+Combined with the producer's **persistent delivery mode** and the **durable**
+queue, this gives at-least-once semantics: a consumer crash mid-processing
+leaves the message un-acked, so the broker redelivers it on reconnect.
+
+## Dead Letter Queue (bonus)
+
+- Exchange `payment.events.dlx` (topic, durable).
+- Queue `notification.payment.completed.dlq` bound to it on routing key
+  `payment.completed`.
+- The main queue is declared with `x-dead-letter-exchange` =
+  `payment.events.dlx`, so any `Nack(false, false)` flows there.
+
+Demo: send a payment for `order_id == 999`. The handler returns `ErrPermanent`
+on every delivery, so after the first attempt the message lands in the DLQ.
+You can inspect it in the management UI at <http://localhost:15672> (guest /
+guest).
+
+## Run
+
+```bash
+docker compose up --build
+```
+
+Watch the logs of `notification-service` in another terminal:
+
+```bash
+docker compose logs -f notification-service
+```
+
+## End-to-end test
+
+```bash
+# happy path — should produce a [Notification] log line
+curl -X POST localhost:8081/orders -H "Content-Type: application/json" \
+  -d '{"customer_id":1,"item_name":"book","amount":5000}'
+
+# idempotency — same Idempotency-Key returns the same order, only one event
+curl -X POST localhost:8081/orders \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: abc-123" \
+  -d '{"customer_id":1,"item_name":"book","amount":5000}'
+
+# DLQ demo — order_id 999 will permanently fail and end up on the DLQ
+curl -X POST localhost:8082/payments \
+  -H "Content-Type: application/json" \
+  -d '{"order_id":999,"amount":1000}'
+```
+
+Then in the RabbitMQ UI (`http://localhost:15672`, guest/guest) check the
+`notification.payment.completed.dlq` queue — depth should be 1.
+
+## Graceful shutdown
+
+Both `payment-service` and `notification-service` install a
+`signal.NotifyContext(SIGINT, SIGTERM)` and use that context to stop accepting
+new work, drain in-flight work, and close their AMQP channels and connections
+cleanly. Try `docker compose stop notification-service` and watch the
+`shutdown signal received, draining…` line in the logs.
+
