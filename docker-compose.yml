@@ -42,9 +42,14 @@ services:
       - DB_NAME=payment_db
       - PAYMENT_GRPC_PORT=50051
       - PAYMENT_REST_PORT=8082
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - PAYMENT_EVENTS_EXCHANGE=payment.events
+      - PAYMENT_EVENTS_DLX=payment.events.dlx
+      - PAYMENT_COMPLETED_ROUTING_KEY=payment.completed
     ports: ["8082:8082", "50051:50051"]
     depends_on:
       db: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
   order-service:
     build:
       context: .
@@ -63,3 +68,19 @@ services:
     depends_on:
       db: { condition: service_healthy }
       payment-service: { condition: service_started }
+
+  notification-service:
+    build:
+      context: .
+      dockerfile: ./notification-service/Dockerfile
+    container_name: notification-service
+    environment:
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - PAYMENT_EVENTS_EXCHANGE=payment.events
+      - PAYMENT_COMPLETED_QUEUE=notification.payment.completed
+      - PAYMENT_COMPLETED_ROUTING_KEY=payment.completed
+      - DLQ_EXCHANGE=payment.events.dlx
+      - DLQ_QUEUE=notification.payment.completed.dlq
+      - MAX_DELIVERY_ATTEMPTS=3
+    depends_on:
+      rabbitmq: { condition: service_healthy }
